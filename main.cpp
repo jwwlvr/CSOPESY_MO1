@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <fstream>
+#include <filesystem>
 
 // CLI text colors
 #define COLOR_GREEN  "\033[0;32m"
@@ -48,7 +50,46 @@ Config g_config;
 bool   g_initialized = false;
 
 // TO-DO: parse txt file
-bool load_config(const std::string& path, Config& out);
+bool load_config(const std::string& path, Config& out) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    std::string key, val;
+    while (file >> key >> val) {
+        // Strip surrounding quotes if present (e.g., "rr" -> rr)
+        if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+            val = val.substr(1, val.size() - 2);
+        }
+
+        try {
+            if (key == "num-cpu" || key == "num_cpu") {
+                int c = std::stoi(val);
+                if (c >= 1 && c <= 128) out.num_cpu = c;
+            } else if (key == "scheduler") {
+                if (val == "fcfs" || val == "rr") out.scheduler = val;
+            } else if (key == "quantum-cycles" || key == "quantum_cycles") {
+                out.quantum_cycles = static_cast<uint32_t>(std::stoul(val));
+            } else if (key == "batch-process-freq" || key == "batch_process_freq") {
+                out.batch_process_freq = static_cast<uint32_t>(std::stoul(val));
+            } else if (key == "min-ins" || key == "min_ins") {
+                out.min_ins = static_cast<uint32_t>(std::stoul(val));
+            } else if (key == "max-ins" || key == "max_ins") {
+                out.max_ins = static_cast<uint32_t>(std::stoul(val));
+            } else if (key == "delays-per-exec" || key == "delay-per-exec" || key == "delay_per_exec") {
+                out.delay_per_exec = static_cast<uint32_t>(std::stoul(val));
+            }
+        } catch (...) {
+            // Ignore parse errors and retain default values
+        }
+    }
+
+    if (out.min_ins > out.max_ins) {
+        std::swap(out.min_ins, out.max_ins);
+    }
+    return true;
+}
 
 // Process
 enum class InsType { PRINT, DECLARE, ADD, SUBTRACT, SLEEP, FOR };
@@ -101,6 +142,8 @@ struct Scheduler {
     void stop()   {}   // join cores
 };
 
+Scheduler g_scheduler;
+
 // process generator used by scheduler-start / scheduler-stop
 std::atomic<bool> g_generating{false};
 std::thread       g_generator_thread;
@@ -145,7 +188,23 @@ void clear_screen() { std::cout << "\033[2J\033[H" << std::flush; }
 // Commands
 void cmd_initialize() {
     // ADD HERE: load config, set initial state, start scheduler, start generator
-    print_message("[stub] initialize");
+    if (g_initialized) {
+        print_message("\nSystem has already been initialized.");
+        return;
+    }
+
+    const std::string config_path = "config.txt";
+    if (!load_config(config_path, g_config)) {
+        print_message("\nError: Failed to open " + config_path + ". Using default configurations.");
+    }
+
+    g_scheduler.start();
+    g_initialized = true;
+
+    print_message("\nSystem initialized successfully.");
+    print_message("Cores: " + std::to_string(g_config.num_cpu) + 
+                  " | Scheduler: " + g_config.scheduler + 
+                  " | Quantum: " + std::to_string(g_config.quantum_cycles));
 }
 
 void cmd_scheduler_start() { print_message("scheduler-start"); } 
@@ -229,20 +288,28 @@ int main() {
         else if (cmd == "initialize") {
             cmd_initialize();
         }
-        else if (cmd == "screen") {
-            cmd_screen(args);
-        }
-        else if (cmd == "scheduler-start") {
-            cmd_scheduler_start();
-        }
-        else if (cmd == "scheduler-stop") {
-            cmd_scheduler_stop();
-        }
-        else if (cmd == "report-util") {
-            cmd_report_util();
-        }
         else {
-            print_message("Unknown command.");
+            // must initialize before other commands
+            if (!g_initialized) {
+                print_message("System not initialized. Please run 'initialize' first.");
+                continue;
+            }
+
+            if (cmd == "screen") {
+                cmd_screen(args);
+            }
+            else if (cmd == "scheduler-start") {
+                cmd_scheduler_start();
+            }
+            else if (cmd == "scheduler-stop") {
+                cmd_scheduler_stop();
+            }
+            else if (cmd == "report-util") {
+                cmd_report_util();
+            }
+            else {
+                print_message("Unknown command.");
+            }
         }
     }
     return 0;
