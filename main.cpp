@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <iomanip>
 #include <ctime>
+#include <random>
 
 // CLI text colors
 #define COLOR_GREEN  "\033[0;32m"
@@ -52,6 +53,9 @@ struct Config {
 
 Config g_config;
 bool   g_initialized = false;
+
+// global counter for unique process IDs
+std::atomic<int> g_pid_counter{1};
 
 // TO-DO: parse txt file
 bool load_config(const std::string& path, Config& out) {
@@ -189,6 +193,129 @@ std::string get_current_timestamp() {
     char buf[64];
     std::strftime(buf, sizeof(buf), "(%m/%d/%Y %I:%M:%S%p)", &tm_buf);
     return std::string(buf);
+}
+
+inline int random_int(int low, int high) {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<int> dist(low, high);
+    return dist(rng);
+}
+
+// generates a randomized operand (either an existing variable or a uint16 immediate)
+Operand generate_random_operand(const std::vector<std::string>& var_pool) {
+    Operand op;
+    if (!var_pool.empty() && random_int(0, 1) == 0) {
+        op.is_var = true;
+        op.name = var_pool[random_int(0, static_cast<int>(var_pool.size()) - 1)];
+    } else {
+        op.is_var = false;
+        op.value = static_cast<uint16_t>(random_int(0, 100));
+    }
+    return op;
+}
+
+Instruction generate_random_instruction(const std::string& proc_name, std::vector<std::string>& var_pool, int depth = 0) {
+    Instruction ins;
+    
+    // Pick instruction type: 0: PRINT, 1: DECLARE, 2: ADD, 3: SUBTRACT, 4: SLEEP, 5: FOR
+    // If nesting depth has reached 3, forbid nested FOR loops
+    int max_type = (depth < 3) ? 5 : 4;
+    int type_idx = random_int(0, max_type);
+
+    switch (type_idx) {
+        case 0: { // PRINT
+            ins.type = InsType::PRINT;
+            ins.msg = "Hello world from " + proc_name + "!";
+            break;
+        }
+        case 1: { // DECLARE
+            ins.type = InsType::DECLARE;
+            ins.var = "var_" + std::to_string(var_pool.size() + 1);
+            ins.a.is_var = false;
+            ins.a.value = static_cast<uint16_t>(random_int(0, 1000));
+            var_pool.push_back(ins.var);
+            break;
+        }
+        case 2: { // ADD
+            ins.type = InsType::ADD;
+            if (var_pool.empty()) {
+                ins.var = "var_1";
+                var_pool.push_back(ins.var);
+            } else {
+                ins.var = var_pool[random_int(0, static_cast<int>(var_pool.size()) - 1)];
+            }
+            ins.a = generate_random_operand(var_pool);
+            ins.b = generate_random_operand(var_pool);
+            break;
+        }
+        case 3: { // SUBTRACT
+            ins.type = InsType::SUBTRACT;
+            if (var_pool.empty()) {
+                ins.var = "var_1";
+                var_pool.push_back(ins.var);
+            } else {
+                ins.var = var_pool[random_int(0, static_cast<int>(var_pool.size()) - 1)];
+            }
+            ins.a = generate_random_operand(var_pool);
+            ins.b = generate_random_operand(var_pool);
+            break;
+        }
+        case 4: { // SLEEP
+            ins.type = InsType::SLEEP;
+            ins.sleep = static_cast<uint8_t>(random_int(1, 5)); // 1 to 5 ticks
+            break;
+        }
+        case 5: { // FOR (nested loop)
+            ins.type = InsType::FOR;
+            ins.repeats = static_cast<uint32_t>(random_int(2, 4));
+            int body_size = random_int(1, 3);
+            for (int i = 0; i < body_size; ++i) {
+                ins.body.push_back(generate_random_instruction(proc_name, var_pool, depth + 1));
+            }
+            break;
+        }
+    }
+    return ins;
+}
+
+// Recursively counts total code lines represented by instructions (including loop bodies)
+size_t count_instruction_lines(const std::vector<Instruction>& ins_list) {
+    size_t total = 0;
+    for (const auto& ins : ins_list) {
+        total++; // count the instruction line itself
+        if (ins.type == InsType::FOR) {
+            total += count_instruction_lines(ins.body);
+        }
+    }
+    return total;
+}
+
+// main function to create fully initialized dummy processes
+ProcPtr generate_dummy_process(const std::string& name) {
+    auto proc = std::make_shared<Process>();
+    proc->id = g_pid_counter.fetch_add(1);
+    proc->name = name;
+    proc->state = State::READY;
+    proc->pc = 0;
+
+    // pick target instruction count between min_ins and max_ins
+    uint32_t target_ins = (g_config.max_ins > g_config.min_ins)
+                          ? random_int(g_config.min_ins, g_config.max_ins)
+                          : g_config.min_ins;
+    //safety guard in case target ins is 0 (avoid crashes and division by zero)
+    if (target_ins == 0) target_ins = 1;
+
+    std::vector<std::string> var_pool;
+    proc->instructions.reserve(target_ins);
+
+    while (proc->instructions.size() < target_ins) {
+        proc->instructions.push_back(generate_random_instruction(name, var_pool, 0));
+    }
+
+    // set line_count to match total lines of code
+    proc->line_count = count_instruction_lines(proc->instructions);
+
+    return proc;
 }
 
 // Scheduler
