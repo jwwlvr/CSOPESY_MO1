@@ -16,6 +16,10 @@
 #include <unordered_map>
 #include <fstream>
 #include <filesystem>
+#include <queue>
+#include <condition_variable>
+#include <iomanip>
+#include <ctime>
 
 // CLI text colors
 #define COLOR_GREEN  "\033[0;32m"
@@ -132,18 +136,6 @@ struct Process {
 };
 using ProcPtr = std::shared_ptr<Process>;
 
-// Scheduler
-std::atomic<uint64_t> g_cpu_ticks{0};
-
-struct Scheduler {
-    // ADD HERE: ready queue (+ mutex/condvar), running/finished lists,
-    //       core worker threads, tick thread, quantum handling for "rr"
-    void start()  {}   // spin up cores
-    void stop()   {}   // join cores
-};
-
-Scheduler g_scheduler;
-
 // process generator used by scheduler-start / scheduler-stop
 std::atomic<bool> g_generating{false};
 std::thread       g_generator_thread;
@@ -184,6 +176,32 @@ void print_welcome() {
 }
 
 void clear_screen() { std::cout << "\033[2J\033[H" << std::flush; }
+
+std::string get_current_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t tt = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf;
+#ifdef _WIN32
+    localtime_s(&tm_buf, &tt);
+#else
+    localtime_r(&tt, &tm_buf);
+#endif
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "(%m/%d/%Y %I:%M:%S%p)", &tm_buf);
+    return std::string(buf);
+}
+
+// Scheduler
+std::atomic<uint64_t> g_cpu_ticks{0};
+
+struct Scheduler {
+    // ADD HERE: ready queue (+ mutex/condvar), running/finished lists,
+    //       core worker threads, tick thread, quantum handling for "rr"
+    void start()  {}   // spin up cores
+    void stop()   {}   // join cores
+};
+
+Scheduler g_scheduler;
 
 // Commands
 void cmd_initialize() {
