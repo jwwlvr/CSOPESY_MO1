@@ -117,11 +117,18 @@ struct Instruction {
     uint8_t sleep = 0;
     std::vector<Instruction> body;
     uint32_t repeats = 0;
+    size_t line = 0;
 };
 
 enum class State { READY, RUNNING, SLEEPING, FINISHED };
 
 struct LogEntry { std::string timestamp; int core; std::string msg; };
+
+struct Frame {
+    const std::vector<Instruction>* body = nullptr;
+    size_t id = 0;
+    uint32_t remaining = 1;
+};
 
 struct Process {
     int id = 0;
@@ -137,6 +144,7 @@ struct Process {
     uint64_t wake_tick = 0; 
     uint32_t quantum_used = 0;
     std::mutex  m;
+    std::vector<Frame> stack;
 };
 using ProcPtr = std::shared_ptr<Process>;
 
@@ -278,6 +286,16 @@ Instruction generate_random_instruction(const std::string& proc_name, std::vecto
     return ins;
 }
 
+// assign line nums to instructions
+void num_lines (std::vector<Instruction>& ins_list, size_t& next) {
+    for (auto& ins : ins_list) {
+        ins.line = next++;
+        if (ins.type == InsType::FOR) {
+            num_lines(ins.body, next);
+        }
+    }
+}
+
 // Recursively counts total code lines represented by instructions (including loop bodies)
 size_t count_instruction_lines(const std::vector<Instruction>& ins_list) {
     size_t total = 0;
@@ -315,17 +333,215 @@ ProcPtr generate_dummy_process(const std::string& name) {
     // set line_count to match total lines of code
     proc->line_count = count_instruction_lines(proc->instructions);
 
+    size_t next_line = 1;
+    num_lines(proc->instructions, next_line);
+    proc->stack.push_back(Frame{&proc->instructions, 0, 1}); // initialize stack with main instruction list
+
     return proc;
 }
+
+uint16_t operand_value(Process& p, const Operand& op) {
+    if (!op.is_var) return op.value;
+    return p.vars[op.name]; // undeclared variables auto-declare as 0
+}
+
+uint16_t clamp_u16(int64_t v) {
+    if (v < 0) return 0;
+    if (v > 65535) return 65535;
+    return static_cast<uint16_t>(v);
+}
+
+// MOves the process stack forward to the next instruction, returning true if there is a next instruction, false if the process has finished.
+bool advance(Process& proc) {
+    while (!proc.stack.empty()) {
+        Frame& f = proc.stack.back();
+        if (f.id >= f.body->size()) {
+            if (--f.remaining > 0) f.id = 0; // next loop iteration
+            else proc.stack.pop_back();
+            continue;
+        }
+        const Instruction& ins = (*f.body)[f.id];
+        if (ins.type == InsType::FOR) {
+            f.id++;
+            if (ins.repeats > 0 && !ins.body.empty())
+                proc.stack.push_back(Frame{&ins.body, 0, ins.repeats}); // may invalidate f
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+// Executes the next instruction of the process, updating its state and logs. Returns true if an instruction was executed, false if the process has finished.
+bool step_process(Process& proc, int core, uint64_t now_tick) {
+    if (advance(proc)) {
+        Frame& f = proc.stack.back();
+        const Instruction& ins = (*f.body)[f.id++];
+        switch (ins.type) {
+            case InsType::PRINT: {
+                std::string msg = ins.msg;
+                if (!ins.print_var.empty()) msg += std::to_string(proc.vars[ins.print_var]);
+                proc.logs.push_back({get_current_timestamp(), core, msg});
+                break;
+            }
+            case InsType::DECLARE:
+                proc.vars[ins.var] = ins.a.value;
+                break;
+            case InsType::ADD:
+                proc.vars[ins.var] = clamp_u16(int64_t(operand_value(proc, ins.a)) + operand_value(proc, ins.b));
+                break;
+            case InsType::SUBTRACT:
+                proc.vars[ins.var] = clamp_u16(int64_t(operand_value(proc, ins.a)) - operand_value(proc, ins.b));
+                break;
+            case InsType::SLEEP:
+                proc.state = State::SLEEPING;
+                proc.wake_tick = now_tick + ins.sleep;
+                break;
+            default: break;
+        }
+        proc.pc = ins.line;
+        return true;
+    }
+    return false;
+}
+
+constexpr int TICK_MS = 10;
+
+struct Core {
+    ProcPtr proc;
+    uint32_t delay_left = 0;   // busy-wait ticks before the next instruction
+};
 
 // Scheduler
 std::atomic<uint64_t> g_cpu_ticks{0};
 
 struct Scheduler {
-    // ADD HERE: ready queue (+ mutex/condvar), running/finished lists,
-    //       core worker threads, tick thread, quantum handling for "rr"
-    void start()  {}   // spin up cores
-    void stop()   {}   // join cores
+    std::mutex m;// guards everything below
+    std::vector<Core> cores;
+    std::queue<ProcPtr> ready;
+    std::vector<ProcPtr> sleeping;
+    std::vector<ProcPtr> finished;
+    std::unordered_map<std::string, ProcPtr>  by_name; // newest process per name
+
+    std::atomic<bool> running{false};
+    std::thread tick_thread;
+    std::vector<std::thread> workers;
+    std::condition_variable  cv;
+    int next_auto_name = 1;
+
+    std::string next_name() {   // caller holds m
+        while (true) {
+            std::ostringstream os;
+            os << "p" << std::setw(2) << std::setfill('0') << next_auto_name++;
+            auto it = by_name.find(os.str());
+            if (it == by_name.end() || it->second->state == State::FINISHED) return os.str();
+        }
+    }
+
+        void wake_sleepers(uint64_t now) {   // caller holds m
+        for (size_t i = 0; i < sleeping.size();) {
+            if (now >= sleeping[i]->wake_tick) {
+                sleeping[i]->state = State::READY;
+                ready.push(sleeping[i]);
+                sleeping.erase(sleeping.begin() + i);
+            } else ++i;
+        }
+    }
+
+    // One CPU cycle on core ci (FCFS / RR, delay-per-exec, state transitions). Caller holds m.
+    void core_cycle(size_t ci, uint64_t now) {
+        const bool rr = (g_config.scheduler == "rr");
+        Core& c = cores[ci];
+
+        if (!c.proc) {
+            if (ready.empty()) return;
+            c.proc = ready.front(); ready.pop();
+            c.proc->quantum_used = 0;
+            c.delay_left   = 0;
+            c.proc->state  = State::RUNNING;
+            c.proc->core   = static_cast<int>(ci);
+            if (c.proc->start_time.empty()) c.proc->start_time = get_current_timestamp();
+        }
+
+        Process& p = *c.proc;
+        p.quantum_used++;
+
+        if (c.delay_left > 0) {
+            c.delay_left--;
+        } else {
+            step_process(p, static_cast<int>(ci), now);
+            c.delay_left = g_config.delay_per_exec;
+        }
+
+        if (!advance(p)) { // nothing left to run: done
+            p.pc       = p.line_count;
+            p.state    = State::FINISHED;
+            p.end_time = get_current_timestamp();
+            p.core     = -1;
+            finished.push_back(c.proc);
+            c.proc.reset();
+        } else if (p.state == State::SLEEPING) {    // SLEEP relinquishes the CPU
+            p.core = -1;
+            sleeping.push_back(c.proc);
+            c.proc.reset();
+        } else if (rr && p.quantum_used >= g_config.quantum_cycles) { // preempt
+            p.state = State::READY;
+            p.core  = -1;
+            ready.push(c.proc);
+            c.proc.reset();
+        }
+    }
+
+   //runs exactly one cycle per CPU tick.
+    void core_worker(size_t ci) {
+        uint64_t last = 0;
+        std::unique_lock<std::mutex> lock(m);
+        while (true) {
+            cv.wait(lock, [&] { return !running || g_cpu_ticks.load() != last; });
+            if (!running) break;
+            last = g_cpu_ticks.load();
+            core_cycle(ci, last);
+        }
+    }
+
+    void start() {
+        if (running.exchange(true)) return;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            cores.assign(g_config.num_cpu, Core{});
+        }
+        for (size_t ci = 0; ci < static_cast<size_t>(g_config.num_cpu); ++ci)
+            workers.emplace_back([this, ci] { core_worker(ci); });
+
+        // tick thread: advances time, wakes sleepers, generates processes
+        tick_thread = std::thread([this] {
+            uint32_t since_batch = 0;
+            while (running) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(TICK_MS));
+                {
+                    std::lock_guard<std::mutex> lock(m);
+                    uint64_t now = ++g_cpu_ticks;
+                    wake_sleepers(now);
+                    if (g_generating && ++since_batch >= g_config.batch_process_freq) {
+                        since_batch = 0;
+                        auto p = generate_dummy_process(next_name());
+                        by_name[p->name] = p;
+                        ready.push(p);
+                    }
+                }
+                cv.notify_all(); // let every core run this tick
+            }
+        });
+    }
+
+    void stop() {
+        if (!running.exchange(false)) return;
+        { std::lock_guard<std::mutex> lock(m); } // make sure no worker misses the wake-up
+        cv.notify_all();
+        if (tick_thread.joinable()) tick_thread.join();
+        for (auto& w : workers) if (w.joinable()) w.join();
+        workers.clear();
+    }
 };
 
 Scheduler g_scheduler;
@@ -352,10 +568,69 @@ void cmd_initialize() {
                   " | Quantum: " + std::to_string(g_config.quantum_cycles));
 }
 
-void cmd_scheduler_start() { print_message("scheduler-start"); } 
-void cmd_scheduler_stop()  { print_message("scheduler-stop");  }
+void cmd_scheduler_start() {
+    if (g_generating.exchange(true)) {
+        print_message("Scheduler is already generating processes.");
+        return;
+    }
+    print_message("Scheduler started: generating a process every " +
+                  std::to_string(g_config.batch_process_freq) + " CPU tick(s).");
+}
+
+void cmd_scheduler_stop() {
+    if (!g_generating.exchange(false)) {
+        print_message("Scheduler is not generating processes.");
+        return;
+    }
+    print_message("Scheduler stopped.");
+}
 void cmd_report_util()     { print_message("report-util");     } 
-void cmd_screen_ls()       { print_message("screen -ls");      } 
+
+// screen -ls, shows running and finished processes, their core, PC, and line count
+std::string build_status_report() {
+    std::lock_guard<std::mutex> lock(g_scheduler.m);
+
+    std::vector<ProcPtr> running_procs;
+    for (const auto& c : g_scheduler.cores)
+        if (c.proc) running_procs.push_back(c.proc);
+
+    const size_t total_cores = g_scheduler.cores.size();
+    const size_t used        = running_procs.size();
+    const size_t utilization = total_cores ? (used * 100) / total_cores : 0;
+
+    size_t name_w = 10;
+    for (const auto& p : running_procs)  {
+        name_w = std::max(name_w, p->name.size());
+    }
+    for (const auto& p : g_scheduler.finished)  {
+        name_w = std::max(name_w, p->name.size());
+    }
+    name_w += 3;
+
+    std::ostringstream os;
+    os << "CPU utilization: " << utilization << "%\n"
+       << "Cores used: " << used << "\n"
+       << "Cores available: " << (total_cores - used) << "\n\n"
+       << "--------------------------------------\n"
+       << "Running processes:\n";
+    for (const auto& p : running_procs) {
+        os << std::left << std::setw(static_cast<int>(name_w)) << p->name
+           << p->start_time << "    Core: " << std::setw(6) << p->core
+           << p->pc << " / " << p->line_count << "\n";
+    }
+    os << "\nFinished processes:\n";
+    for (const auto& p : g_scheduler.finished) {
+        os << std::left << std::setw(static_cast<int>(name_w)) << p->name
+           << p->start_time << "    " << std::setw(12) << "Finished"
+           << p->line_count << " / " << p->line_count << "\n";
+    }
+    os << "--------------------------------------";
+    return os.str();
+}
+
+void cmd_screen_ls() {
+    print_message(build_status_report());
+}
 
 
 void process_screen(const std::string& name) {
@@ -426,7 +701,8 @@ int main() {
         }
 
         if (cmd == "exit") {
-            // ADD HERE: stop scjeduler & generator
+            g_generating = false;
+            g_scheduler.stop();
             print_message("Terminating console...");
             running = false;
         }
