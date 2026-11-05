@@ -343,8 +343,16 @@ ProcPtr generate_dummy_process(const std::string& name) {
     std::vector<std::string> var_pool;
     proc->instructions.reserve(target_ins);
 
-    while (proc->instructions.size() < target_ins) {
-        proc->instructions.push_back(generate_random_instruction(name, var_pool, 0));
+    size_t lines = 0;
+    while (lines < target_ins) {
+        Instruction ins = generate_random_instruction(name, var_pool, 0);
+        size_t cost = 1 + count_instruction_lines(ins.body);
+        if (lines + cost > target_ins) {
+            ins = generate_random_instruction(name, var_pool, 3);
+            cost = 1;
+        }
+        lines += cost;
+        proc->instructions.push_back(std::move(ins));
     }
 
     // set line_count to match total lines of code
@@ -692,19 +700,24 @@ void cmd_screen_ls() {
 // process screen attached to a real process (used by screen -r)
 // TODO: process-smi tas on-entry process info/logs dito
 void render_process_smi(const ProcPtr& proc) {
-    std::lock_guard<std::mutex> lock(proc->m);
     std::ostringstream os;
-    os << "\nProcess name: " << proc->name << "\n"
-       << "ID: " << proc->id << "\n"
-       << "Logs:\n";
-    for (const auto& log : proc->logs) {
-        os << log.timestamp << " Core: " << log.core << "    \"" << log.msg << "\"\n";
+    {
+        // workers change logs/pc/state under the scheduler lock, so read them under it too
+        std::lock_guard<std::mutex> lock(g_scheduler.m);
+        os << "\nProcess name: " << proc->name << "\n"
+           << "ID: " << proc->id << "\n"
+           << "Logs:\n";
+        for (const auto& log : proc->logs) {
+            os << log.timestamp << " Core:" << log.core << " \"" << log.msg << "\"\n";
+        }
+        if (proc->state == State::FINISHED) {
+            os << "\nFinished!\n";
+        } else {
+            os << "\nCurrent instruction line: " << proc->pc << "\n"
+               << "Lines of code: " << proc->line_count << "\n";
+        }
     }
-    if (proc->state == State::FINISHED) {
-        os << "Finished!\n";
-    }
-    os << "Current instruction line: " << proc->pc << "\n"
-       << "Lines of code: " << proc->line_count << "\n";
+    std::lock_guard<std::mutex> lock(console_mutex);
     std::cout << os.str() << std::flush;
 }
 
