@@ -581,7 +581,7 @@ struct Scheduler {
                     std::lock_guard<std::mutex> lock(m);
                     uint64_t now = ++g_cpu_ticks;
                     wake_sleepers(now);
-                    if (g_generating && ++since_batch >= g_config.batch_process_freq && ready.size() < cores.size()) { // backlog cap: don't outrun the cores
+                       if (g_generating && ++since_batch >= g_config.batch_process_freq * 10u && ready.size() < cores.size()) {
                         since_batch = 0;
                         auto p = generate_dummy_process(next_name());
                         by_name[p->name] = p;
