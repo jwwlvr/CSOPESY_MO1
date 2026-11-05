@@ -336,34 +336,44 @@ ProcPtr generate_dummy_process(const std::string& name) {
     proc->state = State::READY;
     proc->pc = 0;
 
+    //symbol table initialized with "x" = 0
+    proc->vars["x"] = 0;
+
     // pick target instruction count between min_ins and max_ins
     uint32_t target_ins = (g_config.max_ins > g_config.min_ins)
                           ? random_int(g_config.min_ins, g_config.max_ins)
                           : g_config.min_ins;
-    //safety guard in case target ins is 0 (avoid crashes and division by zero)
     if (target_ins == 0) target_ins = 1;
 
-    std::vector<std::string> var_pool;
     proc->instructions.reserve(target_ins);
 
-    size_t lines = 0;
-    while (lines < target_ins) {
-        Instruction ins = generate_random_instruction(name, var_pool, 0);
-        size_t cost = 1 + count_instruction_lines(ins.body);
-        if (lines + cost > target_ins) {
-            ins = generate_random_instruction(name, var_pool, 3);
-            cost = 1;
+    // alternating [PRINT, ADD, PRINT, ADD, ...]
+    for (uint32_t i = 0; i < target_ins; ++i) {
+        Instruction ins;
+        if (i % 2 == 0) {
+            // PRINT ("Value from: " + x)
+            ins.type = InsType::PRINT;
+            ins.msg = "Value from: ";
+            ins.print_var = "x";
+        } else {
+            // ADD (x, x, [1 - 10]) -> x = x + random(1, 10)
+            ins.type = InsType::ADD;
+            ins.var = "x";
+            
+            ins.a.is_var = true;
+            ins.a.name = "x";
+
+            ins.b.is_var = false;
+            ins.b.value = static_cast<uint16_t>(random_int(1, 10));
         }
-        lines += cost;
         proc->instructions.push_back(std::move(ins));
     }
 
-    // set line_count to match total lines of code
-    proc->line_count = count_instruction_lines(proc->instructions);
+    proc->line_count = proc->instructions.size();
 
     size_t next_line = 1;
     num_lines(proc->instructions, next_line);
-    proc->stack.push_back(Frame{&proc->instructions, 0, 1}); // initialize stack with main instruction list
+    proc->stack.push_back(Frame{&proc->instructions, 0, 1});
 
     return proc;
 }
@@ -539,17 +549,19 @@ struct Scheduler {
         }
     }
 
-   //runs exactly one cycle per CPU tick.
     void core_worker(size_t ci) {
         uint64_t last = 0;
-        std::unique_lock<std::mutex> lock(m);
-        while (true) {
-            cv.wait(lock, [&] { return !running || g_cpu_ticks.load() != last; });
-            if (!running) break;
-            last = g_cpu_ticks.load();
-            core_cycle(ci, last);
+        while (running) {
+            {
+                std::unique_lock<std::mutex> lock(m);
+                cv.wait(lock, [&] { return !running || g_cpu_ticks.load() != last; });
+                if (!running) break;
+                last = g_cpu_ticks.load();
+                core_cycle(ci, last);
+            }
         }
     }
+
 
     void start() {
         if (running.exchange(true)) return;
@@ -834,7 +846,7 @@ int main() {
             if (cmd == "screen") {
                 cmd_screen(args);
             }
-            else if (cmd == "scheduler-start") {
+            else if (cmd == "scheduler-start"  || cmd == "scheduler-test") {
                 cmd_scheduler_start();
             }
             else if (cmd == "scheduler-stop") {
