@@ -112,7 +112,10 @@ bool load_config(const std::string& path, Config& out) {
     }
 
     if (out.min_ins > out.max_ins) {
-        std::swap(out.min_ins, out.max_ins);
+        std::cout << "Error: Inconsistent instruction limits (min-ins=" << out.min_ins 
+                << " > max-ins=" << out.max_ins << "). Reverting to default instruction limits.\n";
+        out.min_ins = Config{}.min_ins;
+        out.max_ins = Config{}.max_ins;
     }
     return true;
 }
